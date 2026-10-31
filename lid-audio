@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Keep audio playing with the lid shut, but only while sound is actually
+# audible. With no playback (and no external monitor) the stock logind
+# behaviour applies: closing the lid suspends the machine.
+set -u
+
+LID=${LID:-/proc/acpi/button/lid/LID0/state}
+POLL=${POLL:-1}                 # lid / stream poll interval, seconds
+PROBE_SECS=${PROBE_SECS:-0.4}   # length of one level probe, seconds
+PROBE_EVERY=${PROBE_EVERY:-5}   # probe cadence while in audio mode, seconds
+SILENCE_GRACE=${SILENCE_GRACE:-30}
+MIN_DBFS=${MIN_DBFS:--55}       # quieter than this counts as silence
+
+INHIBIT_PID=""
+audio_mode=0
+panel_off=0
+silent_since=""
+last_probe=0
+last_closed=0
+
+lid_closed() {
+  [[ "$(awk '{print $2}' "$LID" 2>/dev/null)" == closed ]]
+}
+
+external_monitor() {
+  local f
+  for f in /sys/class/drm/card*-*/status; do
+    case "$f" in
+      *eDP-* | *LVDS-* | *DSI-*) continue ;;
+    esac
+    [[ "$(cat "$f" 2>/dev/null)" == connected ]] && return 0
+  done
+  return 1
+}
+
+has_output_stream() {
+  pw-cli ls Node 2>/dev/null | grep -q 'media\.class = "Stream/Output/Audio"'
+}
+
+set_dpms() {
+  gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+    --object-path /org/gnome/Mutter/DisplayConfig \
+    --method org.freedesktop.DBus.Properties.Set \
+    org.gnome.Mutter.DisplayConfig PowerSaveMode "<int32 $1>" >/dev/null 2>&1
+}
+
+lock_session() {
+  gdbus call --session --dest org.gnome.ScreenSaver \
+    --object-path /org/gnome/ScreenSaver \
+    --method org.gnome.ScreenSaver.SetActive true >/dev/null 2>&1
+}
+
+# RMS level of the default sink's monitor in dBFS (-100 == silence).
+# Returns 0 (audible) if the level cannot be measured, so that a broken
+# probe never cuts playback short.
+probe_dbfs() {
+  local sink level
+  command -v ffmpeg >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || {
+    echo 0
+    return
+  }
+  sink=$(wpctl inspect @DEFAULT_AUDIO_SINK@ 2>/dev/null |
+    sed -n 's/.*node\.name = "\(.*\)"/\1/p' | head -n1)
+  if [[ -z "$sink" ]]; then
+    echo 0
+    return
+  fi
+  level=$(timeout 3 ffmpeg -hide_banner -loglevel error \
+    -f pulse -i "$sink.monitor" -t "$PROBE_SECS" \
+    -ac 1 -ar 48000 -f s16le - 2>/dev/null |
+    python3 -c '
+import sys, struct, math
+data = sys.stdin.buffer.read()
+count = len(data) // 2
+if count == 0:
+    print("-100")
+    raise SystemExit
+samples = struct.unpack("<%dh" % count, data)
+rms = math.sqrt(sum(s * s for s in samples) / count) / 32768.0
+print("-100" if rms <= 1e-6 else round(20 * math.log10(rms), 1))
+')
+  echo "${level:-0}"
+}
+
+is_audible() {
+  local level
+  level=$(probe_dbfs)
+  awk -v level="$level" -v min="$MIN_DBFS" 'BEGIN { exit !(level > min) }'
+}
+
+inhibit_on() {
+  [[ -n "$INHIBIT_PID" ]] && return 0
+  systemd-inhibit --what=handle-lid-switch --who=lid-audio \
+    --why="Audio playing with the lid closed" --mode=block \
+    sleep infinity 2>/dev/null &
+  INHIBIT_PID=$!
+}
+
+inhibit_off() {
+  [[ -z "$INHIBIT_PID" ]] && return 0
+  pkill -TERM -P "$INHIBIT_PID" 2>/dev/null
+  kill -TERM "$INHIBIT_PID" 2>/dev/null
+  wait "$INHIBIT_PID" 2>/dev/null
+  INHIBIT_PID=""
+}
+
+enter_audio_mode() {
+  audio_mode=1
+  silent_since=""
+  last_probe=$(date +%s)
+  inhibit_on
+  lock_session
+  sleep 1 # let the lock screen settle before cutting the panel
+  set_dpms 3
+  panel_off=1
+}
+
+leave_audio_mode() {
+  audio_mode=0
+  silent_since=""
+  if ((panel_off)); then
+    set_dpms 0
+    panel_off=0
+  fi
+}
+
+suspend_now() {
+  inhibit_off
+  systemctl suspend
+}
+
+cleanup() {
+  trap - EXIT TERM INT HUP
+  inhibit_off
+  ((panel_off)) && set_dpms 0
+  exit 0
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT HUP
+
+while :; do
+  now=$(date +%s)
+  closed=0
+  lid_closed && closed=1
+  ext=0
+  external_monitor && ext=1
+  streams=0
+  has_output_stream && streams=1
+
+  # Hold the low-level lid lock only while something may need the machine
+  # awake, so logind stays in charge the rest of the time.
+  if ((streams || ext)); then
+    inhibit_on
+  else
+    inhibit_off
+  fi
+
+  if ((closed)); then
+    if ((!last_closed)); then
+      if ((ext)); then
+        : # docked: the external screen stays in use
+      elif ((streams)) && is_audible; then
+        enter_audio_mode
+      else
+        last_closed=1
+        suspend_now
+        continue
+      fi
+    elif ((audio_mode)); then
+      if ((ext)); then
+        leave_audio_mode # monitor plugged in: keep the panel on
+      elif ((streams)); then
+        if ((now - last_probe >= PROBE_EVERY)); then
+          last_probe=$now
+          if is_audible; then
+            silent_since=""
+          else
+            [[ -n "$silent_since" ]] || silent_since=$now
+            if ((now - silent_since >= SILENCE_GRACE)); then
+              audio_mode=0
+              last_closed=1
+              suspend_now
+              continue
+            fi
+          fi
+        fi
+      else
+        [[ -n "$silent_since" ]] || silent_since=$now
+        if ((now - silent_since >= SILENCE_GRACE)); then
+          audio_mode=0
+          last_closed=1
+          suspend_now
+          continue
+        fi
+      fi
+    fi
+  else
+    leave_audio_mode
+  fi
+
+  last_closed=$closed
+  sleep "$POLL"
+done
